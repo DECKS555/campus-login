@@ -1,0 +1,32 @@
+# 用户隐私配置与运行日志——绝对不能提交
+config.json
+login.log
+login.log.*
+app.pid
+daemon_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# 打包中间产物
+build/
+dist/
+*.spec
+*.old
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 杂项
+*.zip
+校园网一键登录-发布包/
+校园网一键登录-对外发布/
