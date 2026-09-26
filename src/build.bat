@@ -64,7 +64,13 @@ echo [4/5] 打包 CampusLogin.exe（带图标 / SVG 图标库）...
 rem --hidden-import PIL.ImageTk：界面抗锯齿靠 ui_render.py 里的 PIL.ImageTk，
 rem   而它是**惰性导入**（放在函数里，避免 daemon 模式捎带加载 tkinter）。
 rem   显式声明，避免 PyInstaller 漏收导致 exe 里退回无抗锯齿的旧画法。
-"%VENV%\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --name CampusLogin --icon "%ASSETS%\app.ico" --add-data "%ASSETS%\app.png;assets" --add-data "%ASSETS%\icons;icons" --hidden-import PIL.ImageTk --distpath "%APPDIR%" --workpath "%WORK%" --specpath "%WORK%" "%SRC%app.py" || (echo [错误] 打包失败 & pause & exit /b 1)
+rem --add-data app.ico;assets：**务必保留**。--icon 只设置 exe 文件的图标资源，
+rem   不会把它放进 _MEIPASS；而窗口/任务栏图标走的是 iconbitmap(assets\app.ico)。
+rem   漏了这条 -> frozen 下 asset_path("app.ico") 找不到 -> 标题栏和任务栏退回
+rem   Tk 默认的羽毛图标（v2.1.1 修的正是这类「图标显示不对」）。
+rem --hidden-import notify_win：它是在 login_core 的函数里惰性 import 的，
+rem   且通知失败是静默的，漏收线上只表现为"气泡永远不弹"，必须显式声明。
+"%VENV%\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --name CampusLogin --icon "%ASSETS%\app.ico" --add-data "%ASSETS%\app.png;assets" --add-data "%ASSETS%\app.ico;assets" --add-data "%ASSETS%\icons;icons" --hidden-import PIL.ImageTk --hidden-import notify_win --distpath "%APPDIR%" --workpath "%WORK%" --specpath "%WORK%" "%SRC%app.py" || (echo [错误] 打包失败 & pause & exit /b 1)
 
 echo [5/5] 清理中间产物 ...
 if exist "%WORK%" rmdir /s /q "%WORK%"

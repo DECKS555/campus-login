@@ -7,9 +7,14 @@
 往往**静默不显示**——看起来"实现了"，实际用户什么都收不到。Shell_NotifyIconW 的
 NIF_INFO 气泡不要求任何注册，是这类程序唯一可靠的选择。
 
-为什么需要一个窗口：Shell_NotifyIconW 必须挂在某个 HWND 上（没有窗口就没有托盘
-图标，也就没有气泡的落点）。所以这里在**独立线程**里建一个消息专用窗口
-（HWND_MESSAGE，不可见、不进任务栏），挂一个托盘图标，然后跑自己的消息循环。
+为什么需要一个窗口：Shell_NotifyIconW 必须挂在某个 HWND 上（没有窗口就没有气泡的
+落点）。所以这里在**独立线程**里建一个消息专用窗口（HWND_MESSAGE，不可见、不进
+任务栏），挂图标、弹气泡，然后跑自己的消息循环。
+
+图标策略（v2.1.1）：**绝不常驻**。原先一启动就 NIM_ADD 且永不删除，任务栏右下角
+通知区域会长期蹲着一个点它还没反应的校园网图标——用户明确说不需要后台程序出现在
+那里。现在改成「按需挂载 + 弹完即卸」：平时一个图标都没有，要弹气泡才临时挂上，
+并请求 NIS_HIDDEN（连那一下也不画），气泡读完后 ICON_LINGER_SECONDS 秒自动摘除。
 
 线程与失败隔离：全部跑在 daemon 线程里，keepalive 主循环只做一次"入队"（deque
 append，微秒级）。任何一步失败都静默吞掉——**通知弹不出来绝不允许影响保活**。
@@ -26,6 +31,7 @@ import time
 NIM_ADD, NIM_MODIFY, NIM_DELETE, NIM_SETVERSION = 0, 1, 2, 4
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_STATE, NIF_INFO, NIF_SHOWTIP = 0x1, 0x2, 0x4, 0x8, 0x10, 0x80
 NIIF_INFO = 0x1
+NIS_HIDDEN = 0x1
 NOTIFYICON_VERSION_4 = 4
 
 WM_APP = 0x8000
@@ -41,13 +47,25 @@ LR_DEFAULTSIZE = 0x40
 
 _TIP = "校园网保活：正在运行"
 
+# 气泡弹出后，图标在通知区域最多再留这么多秒就被**主动摘掉**。
+#
+# v2.1.1 修复的 bug：原来后台保活一启动就把图标 NIM_ADD 挂上且**永不删除**，
+# 于是「状态栏（任务栏右下角通知区域）」长期蹲着一个校园网图标——用户明确表示
+# 不需要后台程序出现在那里，而且那个图标点它还毫无反应（WM_TRAY 里是 pass）。
+# 现在的策略是「按需挂载 + 弹完即卸」：
+#   平时 → 通知区域里**一个图标都没有**；
+#   要弹气泡 → 临时挂图标（带 NIS_HIDDEN，尽量连这短暂的一下都不显示）；
+#   气泡读完 → ICON_LINGER_SECONDS 秒后 NIM_DELETE 摘掉，恢复干净。
+ICON_LINGER_SECONDS = 8.0
+
 # 气泡显示由系统设置决定时长（NOTIFYICON_VERSION_4 起 uTimeout 不再生效）
 _QUEUE = collections.deque(maxlen=8)
 _LOCK = threading.Lock()
-# ready：窗口+图标都挂上了；disabled：起不来（非 Windows / 建窗口失败），不再重试；
-# stopped：被显式 stop()，不自动重启。
+# ready：窗口建好了（可以接通知）；disabled：起不来（非 Windows / 建窗口失败），不再重试；
+# stopped：被显式 stop()，不自动重启。icon_added：当前通知区域里是否挂着我们的图标。
 _STATE = {"thread": None, "hwnd": None, "stop": False,
-          "ready": False, "disabled": False, "stopped": False}
+          "ready": False, "disabled": False, "stopped": False,
+          "icon_added": False, "icon_until": 0.0}
 
 _user32 = None
 _shell32 = None
@@ -219,11 +237,20 @@ def _create_window(user32):
 
 
 def _add_icon(user32, shell32, hwnd):
+    """把图标临时挂到通知区域（气泡的落点）。
+
+    uFlags 里带 NIF_STATE + dwState/NIS_HIDDEN：请求系统**别把图标画出来**，
+    但条目仍然存在、仍然能承载气泡。Windows 10/11 上这条常常被忽略（图标照样
+    出现在「隐藏的图标」浮出层里），所以外面还有一层「弹完即卸」兜底——
+    两层加起来，用户在任何系统版本上都看不到常驻图标。
+    """
     nid = _make_nid(hwnd)
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP | NIF_STATE
     nid.uCallbackMessage = WM_TRAY
     nid.hIcon = _load_icon(user32)
     nid.szTip = _TIP
+    nid.dwState = NIS_HIDDEN
+    nid.dwStateMask = NIS_HIDDEN
     if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
         return False
     # 不 SETVERSION 到 4 的话，NIF_INFO 气泡在新系统上通常不显示
@@ -232,26 +259,57 @@ def _add_icon(user32, shell32, hwnd):
     return True
 
 
+def _ensure_icon(user32, shell32, hwnd):
+    """按需挂图标：已经挂着就直接返回 True（幂等）。"""
+    if _STATE["icon_added"]:
+        return True
+    if not _add_icon(user32, shell32, hwnd):
+        return False
+    _STATE["icon_added"] = True
+    return True
+
+
+def _remove_icon(shell32, hwnd):
+    """把图标从通知区域摘掉（幂等）。摘掉后那里一个校园网图标都不剩。"""
+    if not _STATE["icon_added"]:
+        return
+    try:
+        shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(_make_nid(hwnd)))
+    except Exception:
+        logging.debug("移除通知区域图标失败", exc_info=True)
+    _STATE["icon_added"] = False
+
+
 def _show_balloon(shell32, hwnd, title, message):
     nid = _make_nid(hwnd)
-    nid.uFlags = NIF_INFO | NIF_ICON | NIF_TIP
+    nid.uFlags = NIF_INFO | NIF_ICON | NIF_TIP | NIF_STATE
     nid.hIcon = _load_icon(_libs()[0])
     nid.szTip = _TIP
+    nid.dwState = NIS_HIDDEN
+    nid.dwStateMask = NIS_HIDDEN
     nid.szInfoTitle = str(title)[:63]
     nid.szInfo = str(message)[:255]
     nid.dwInfoFlags = NIIF_INFO
     shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
 
-def _drain(shell32, hwnd):
-    """把排队的通知都弹出去。必须在**拥有窗口的这个线程**上调用。"""
+def _drain(user32, shell32, hwnd):
+    """把排队的通知都弹出去。必须在**拥有窗口的这个线程**上调用。
+
+    图标是**临时**的：这一批通知弹完，把摘除时间记进 _STATE["icon_until"]，
+    由主循环到点摘掉——通知区域因此不会长期挂着校园网图标。
+    """
     while True:
         with _LOCK:
             if not _QUEUE:
                 return
             title, message = _QUEUE.popleft()
         try:
+            if not _ensure_icon(user32, shell32, hwnd):
+                # 图标挂不上就弹不出气泡；丢掉剩余通知，别把队列越堆越长
+                return
             _show_balloon(shell32, hwnd, title, message)
+            _STATE["icon_until"] = time.time() + ICON_LINGER_SECONDS
         except Exception:
             logging.debug("显示气泡通知失败", exc_info=True)
 
@@ -268,9 +326,9 @@ def _run():
             logging.debug("创建通知窗口失败，跳过系统通知")
             return
         _STATE["hwnd"] = hwnd
-        if not _add_icon(user32, shell32, hwnd):
-            logging.debug("添加托盘图标失败，跳过系统通知")
-            return
+        # 注意：**这里刻意不挂图标**。窗口只是气泡的落点，图标按需临时挂、
+        # 弹完就摘（见 _ensure_icon/_remove_icon），这样后台程序平时在
+        # 任务栏通知区域里是完全不可见的（v2.1.1 修复）。
         _STATE["ready"] = True
         user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), ctypes.c_void_p,
                                         ctypes.c_uint32, ctypes.c_uint32,
@@ -280,7 +338,10 @@ def _run():
         msg = MSG()
         while not _STATE["stop"]:
             # 先排空队列再阻塞：气泡只能在拥有窗口的线程上发
-            _drain(shell32, hwnd)
+            _drain(user32, shell32, hwnd)
+            # 通知展示够久了 -> 把图标从通知区域摘掉，别让它常驻
+            if _STATE["icon_added"] and time.time() >= _STATE["icon_until"]:
+                _remove_icon(shell32, hwnd)
             if user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
                 if msg.message == WM_QUIT:
                     break
@@ -294,11 +355,7 @@ def _run():
         logging.debug("通知线程异常退出", exc_info=True)
     finally:
         if hwnd and shell32:
-            try:
-                shell32.Shell_NotifyIconW(NIM_DELETE,
-                                          ctypes.byref(_make_nid(hwnd)))
-            except Exception:
-                pass
+            _remove_icon(shell32, hwnd)
         _STATE["hwnd"] = None
         if not _STATE["ready"]:
             # 起不来就别每来一条通知再试一次（线程会反复生灭）。通知是尽力而为的功能。
@@ -315,6 +372,8 @@ def _ensure_started():
         # 线程没起来或已经死了（例如 stop 之外的意外退出）都重新拉起
         _STATE["stop"] = False
         _STATE["ready"] = False
+        _STATE["icon_added"] = False
+        _STATE["icon_until"] = 0.0
         t = threading.Thread(target=_run, name="campus-notify", daemon=True)
         _STATE["thread"] = t
     t.start()
@@ -355,3 +414,12 @@ def available():
     """当前环境是否支持托盘通知（自检用）。"""
     user32, shell32 = _libs()
     return bool(user32 and shell32)
+
+
+def icon_present():
+    """自检用：当前通知区域里是否挂着我们的图标。
+
+    正常情况下**任何时刻都应为 False**——后台程序不该在任务栏通知区域露面。
+    只有正在弹气泡的 ICON_LINGER_SECONDS 秒窗口内才可能为 True。
+    """
+    return bool(_STATE["icon_added"])

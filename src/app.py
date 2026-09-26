@@ -134,7 +134,7 @@ LOG_TAIL_MAX = 40                       # 日志卡最多显示几行（窗口�
 # 运行日志显示异常"。放得下就显示，一行也放不下就收起来。
 LOG_MIN_ROOM = LOG_ROW_H
 LOG_PAGE_LINES = 200                    # 运行日志页完整视图行数
-APP_VERSION = "v2.1.0"
+APP_VERSION = "v2.1.1"
 
 # 更新服务器的「仓库名」，格式 "用户名/仓库名"（GitHub Releases）。
 # 留空 = 没有配更新服务器，「检查更新」退化为只显示本机版本信息。
