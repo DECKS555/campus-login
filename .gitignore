@@ -30,3 +30,6 @@ dist/
 *.zip
 校园网一键登录-发布包/
 校园网一键登录-对外发布/
+
+# 本机 GitHub Token（pub\github_token.txt）——误推等于泄露，双重保险
+github_token.txt
