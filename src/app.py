@@ -134,7 +134,7 @@ LOG_TAIL_MAX = 40                       # 日志卡最多显示几行（窗口�
 # 运行日志显示异常"。放得下就显示，一行也放不下就收起来。
 LOG_MIN_ROOM = LOG_ROW_H
 LOG_PAGE_LINES = 200                    # 运行日志页完整视图行数
-APP_VERSION = "v2.1.1"
+APP_VERSION = "v2.1.2"
 
 # 更新服务器的「仓库名」，格式 "用户名/仓库名"（GitHub Releases）。
 # 留空 = 没有配更新服务器，「检查更新」退化为只显示本机版本信息。
@@ -596,13 +596,164 @@ def _reg_run_exists(value=None):
         return False
 
 
-def autostart_enabled():
-    """开机自启当前是否生效：计划任务或注册表 Run 项任一存在即算开启。
+def _reg_run_value(value=None):
+    """读取注册表 Run 项里本程序的自启命令原文；不存在返回空串。"""
+    import winreg
+    try:
+        with _reg_run_key() as k:
+            v, _t = winreg.QueryValueEx(k, value or REG_RUN_VALUE)
+            return v if isinstance(v, str) else str(v)
+    except Exception:
+        return ""
 
-    不能只查计划任务——降级到注册表兜底的情况下任务计划里是没有任务的，只看任务
-    会导致界面把"明明开了"显示成"未开启"。
+
+# ---------- 自启登记项的「三态」判定 ----------
+#
+# 只看「有没有登记项」是不够的——这次的 bug 就出在这：注册表里躺着一条指向
+# `D:\first-cc\校园网正式版\CampusLogin.exe` 的自启，而那个目录早被删了。Windows
+# 开机如实跑去执行一个不存在的路径，于是静默什么都不做；界面却因为"查得到登记
+# 项"而显示「已开启」，用户自然以为自启是好的。
+# 现在把每条登记项按"它能不能拉起**本程序**"分成三态：
+#   current = 指向本程序（包括源码模式）<-> 真的生效
+#   foreign = 指向另一个**还在**的副本            <-> 拉的不是我，但能跑起来
+#   missing = 指向的文件已不存在                  <-> 纯粹的垃圾登记，留着只会误导
+
+def _parse_cmd_exe(cmdline):
+    """从一条自启命令行里取出可执行文件部分（支持带引号的路径）。"""
+    s = (cmdline or "").strip()
+    if not s:
+        return ""
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        return s[1:end] if end > 0 else s[1:]
+    return s.split(" ", 1)[0].strip('"')
+
+
+def _is_current_target(cmdline):
+    """这条自启命令拉起的到底是不是「本程序」？
+    frozen 看 exe 路径；源码模式还要对得上 app.py 本身 + --daemon 参数。"""
+    if "--daemon" not in (cmdline or ""):
+        return False
+    exe = _parse_cmd_exe(cmdline)
+    if not exe:
+        return False
+    # 候选「自己」：运行时本体，以及源码调试时同在上层目录的那份 exe
+    try:
+        exe_key = os.path.normcase(os.path.abspath(exe))
+    except Exception:
+        return False
+    candidates = [os.path.normcase(os.path.abspath(sys.executable))]
+    try:
+        candidates.append(os.path.normcase(os.path.abspath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "CampusLogin.exe"))))
+    except Exception:
+        pass
+    if exe_key not in candidates:
+        return False
+    if not getattr(sys, "frozen", False) and exe_key == candidates[0]:
+        # 源码模式：解释器本身要带上 app.py，否则随便哪个 python 都算命中
+        return os.path.normcase(os.path.abspath(__file__)) in os.path.normcase(cmdline or "")
+    return True
+
+
+def _task_commandline():
+    """计划任务里登记的待运行命令行（查不到 / 查失败返回空串）。"""
+    try:
+        p = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME,
+                            "/FO", "LIST", "/V"],
+                           capture_output=True, timeout=15,
+                           creationflags=core.CREATE_NO_WINDOW,
+                           env=core.clean_child_env())
+        if p.returncode != 0:
+            return ""
+        text = (p.stdout + p.stderr).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        if key.strip() in ("要运行的任务", "任务 To Run", "Task To Run"):
+            return val.strip()
+    return ""
+
+
+def _classify(cmdline):
+    """把一条自启命令归类：(可执行文件, current/foreign/missing)。"""
+    if not (cmdline or "").strip():
+        return "", "missing"
+    if _is_current_target(cmdline):
+        return _parse_cmd_exe(cmdline), "current"
+    exe = _parse_cmd_exe(cmdline)
+    return exe, ("foreign" if (exe and os.path.exists(exe)) else "missing")
+
+
+def autostart_state():
+    """开机自启登记情况全量快照。
+
+    返回 dict：
+      items    [(渠道, 命令原文, 目标文件, 分类)]，分类 ∈ current/foreign/missing
+      current  能拉起**本程序**的那些项
+      foreign  指向另一份副本的项
+      missing  目标文件已不存在（或参数不对）的失效项
+      enabled  是否真的会在下次登录时拉起本程序
+      any      有没有任何登记项（不管有效与否）
     """
-    return _query_task() or _reg_run_exists()
+    items = []
+    cmd = _task_commandline()
+    if cmd:
+        exe, kind = _classify(cmd)
+        items.append(("计划任务", cmd, exe, kind))
+    run = _reg_run_value()
+    if run:
+        exe, kind = _classify(run)
+        items.append(("注册表", run, exe, kind))
+    return {
+        "items": items,
+        "current": [i for i in items if i[3] == "current"],
+        "foreign": [i for i in items if i[3] == "foreign"],
+        "missing": [i for i in items if i[3] == "missing"],
+        "enabled": bool([i for i in items if i[3] == "current"]),
+        "any": bool(items),
+    }
+
+
+def clear_broken_autostart(state=None):
+    """删掉「拉不起本程序」的失效登记项（目标文件已不存在 / 参数不对）。
+
+    返回 (清理条数, [被清理的目标路径])。计划任务和注册表都按名字精确删，
+    只碰本程序自己的两个登记名（CampusLoginAppAutoStart / CampusLoginApp）。
+    """
+    st = state if isinstance(state, dict) else autostart_state()
+    removed = []
+    for source, cmd, exe, kind in st["missing"]:
+        if source == "计划任务":
+            _schtasks_delete()
+        else:
+            _reg_run_delete()
+        removed.append(exe or cmd)
+    return len(removed), removed
+
+
+def _drop_redundant_reg_run():
+    """计划任务已生效时清掉多余的注册表登记，免得两套机制都拉、又各拉各的路径。"""
+    if _reg_run_exists() and not _is_current_target(_reg_run_value()):
+        try:
+            logging.info("开机自启：计划任务已生效，清理失效的注册表 Run 项残留")
+        except Exception:
+            pass
+        _reg_run_delete()
+
+
+def autostart_enabled():
+    """开机自启当前是否**真的生效**——不只是"有登记项"。
+
+    失效登记（指向已删除的旧副本）不算开启：以前把它们算成 True，界面一路显示
+    "已开启"，实际开机却什么都不发生，这个假绿灯正是本次故障的根。
+    """
+    if _query_task() and _is_current_target(_task_commandline()):
+        return True
+    return _reg_run_exists() and _is_current_target(_reg_run_value())
 
 
 def register_autostart():
@@ -614,13 +765,28 @@ def register_autostart():
       3. 注册表 Run 项 —— 当前用户权限必成，代价是只有"登录时"这一个触发器
     每级做完都用 autostart_enabled() 复核真实状态，成功即刻返回。
     返回 (是否成功, 提示消息)。
+
+    开注册前先扫一遍**失效登记**：以前不管它，于是上一次装的路径（早已删除的
+    副本）会一直躺在注册表里，而这次注册完界面显示"已开启"，真正开机的却是
+    那条失效项——用户看到的就是"开了但还是不自启"。
     """
+    note = ""
+    state = autostart_state()
+    if state["current"]:
+        return True, "开机自启已设置（下次登录 Windows 时自动启动）"
+    if state["missing"]:
+        n, paths = clear_broken_autostart(state)
+        if n:
+            note = "已清理 %d 条失效的自启残留（%s）；" % (
+                n, "、".join(p for p in paths[:2] if p))
+
     exe_path, argument, work_dir = _task_action_paths()
 
     # 1) 最快路径：schtasks 原生命令
     ok, why = _schtasks_create(exe_path, argument, work_dir)
     if ok and autostart_enabled():
-        return True, "开机自启已设置（下次登录 Windows 时自动启动）"
+        _drop_redundant_reg_run()
+        return True, note + "开机自启已设置（下次登录 Windows 时自动启动）"
 
     # 2) PowerShell：双触发器（登录 + 联网成功），仍然不提权
     ps_path = None
@@ -629,7 +795,8 @@ def register_autostart():
                                                 TASK_NAME))
         _rc, _out = _run_ps(ps_path)
         if autostart_enabled():
-            return True, "开机自启已设置（登录或联网时自动启动）"
+            _drop_redundant_reg_run()
+            return True, note + "开机自启已设置（登录或联网时自动启动）"
     except Exception:
         pass
     finally:
@@ -640,16 +807,20 @@ def register_autostart():
     if _reg_run_set() and _reg_run_exists():
         # 这一级只有"登录时"一个触发器（Run 项没法挂网络事件），所以如实说明，
         # 并点出兜底机制：保活循环自己会重试，网络晚一点就绪也能连上。
-        return True, ("开机自启已设置（下次登录 Windows 时自动启动；"
-                      "若那时网络还没就绪，保活会自行重试连上）")
+        return True, note + ("开机自启已设置（下次登录 Windows 时自动启动；"
+                             "若那时网络还没就绪，保活会自行重试连上）")
 
-    return False, "设置开机自启失败：%s" % (why or "未知原因")
+    return False, note + "设置开机自启失败：%s" % (why or "未知原因")
 
 
 def unregister_autostart():
     """取消开机自启：同时清掉计划任务和注册表 Run 项（都可能被降级路径用过）。
-    同样**全程不弹 UAC**。返回 (是否成功, 提示消息)。"""
-    if not autostart_enabled():
+    同样**全程不弹 UAC**。返回 (是否成功, 提示消息)。
+
+    注意判断依据是"有没有登记项"而不是"开没开成功"：失效登记（指向已删除副本的
+    残留）也得一并清掉，否则用户会陷在"界面说没开、系统里却一直留着"的状态里。
+    """
+    if not autostart_state()["any"]:
         return True, "本来就没有设置开机自启，无需取消"
 
     _schtasks_delete()
@@ -667,9 +838,9 @@ def unregister_autostart():
             _remove_temp(ps_path)
     _reg_run_delete()
 
-    if not autostart_enabled():
+    if not autostart_state()["any"]:
         return True, "已取消开机自启"
-    return False, "取消开机自启失败，请稍后重试（也可在「任务计划程序」中手动删除 CampusLoginAppAutoStart）"
+    return False, "取消开机自启失败：请稍后重试（也可在「任务计划程序」中手动删除 CampusLoginAppAutoStart）"
 
 
 # ============================ 后台保活进程 ============================
@@ -3354,8 +3525,15 @@ if HAS_TK:
                 self.hero.render()
 
         def _set_autostart_ui(self, exists, message=None, ok=True):
-            """开机自启 Toggle + pill + 提示。"""
-            self.autostart_on = bool(exists)
+            """开机自启 Toggle + pill + 提示。
+
+            exists 可以传 bool（旧签名），也可以传 autostart_state() 的字典：
+            字典里带着"另一份副本也在自启"这类信息，能给用户一个**说人话**的回执，
+            而不是对着失效登记报"已开启"。
+            """
+            state = exists if isinstance(exists, dict) else None
+            self.autostart_on = bool(state["enabled"]) if state else bool(exists)
+            self.autostart_state = state
             self.toggle_auto.set_state(self.autostart_on)
             self.toggle_auto.set_enabled(True)
             self.toggle_auto.set_busy(False)
@@ -3366,6 +3544,13 @@ if HAS_TK:
             if message:
                 self._set_result(message, C_SUCCESS_TEXT if ok else C_DANGER_TEXT,
                                  target="boot")
+            elif state is not None and state["foreign"]:
+                # 开着，但开的是另一份副本——说清楚，别让人以为坏事了我的功能
+                _exe = state["foreign"][0][2]
+                self._set_result(
+                    "检测到另一份程序副本也登记了开机自启（%s）。本程序的自启%s。"
+                    % (_exe, "已开启" if self.autostart_on else "未开启"),
+                    C_TEXT_2, target="boot")
 
         # 结果行写哪张卡：'main' = 登录与保活卡（登录/保活/断开），
         # 'boot' = 启动卡（开机自启 / 启动时自动登录）
@@ -3657,9 +3842,17 @@ if HAS_TK:
         def _job_startup(cfg):
             state = core.check_network(cfg)
             daemon = core.daemon_running()
-            task = autostart_enabled()
+            # 开机自启：不只要答案，还要"哪几项登记、各自指向哪里"的完整快照——
+            # 失效残留（指向已删除副本的那条）必须能被界面说清楚，否则又是"显示
+            # 已开启、开机什么都没发生"的假绿灯。清理在这里做（后台线程），
+            # schtasks /Query 最坏 15 秒，放主线程会冻住界面。
+            auto = autostart_state()
+            cleaned = (0, [])
+            if auto["missing"]:
+                cleaned = clear_broken_autostart(auto)
+                auto = autostart_state()
             ip = get_local_ip(str(cfg.get("portal_host", "")))
-            return state, daemon, task, ip
+            return state, daemon, auto, ip, cleaned
 
         def _done_startup(self, result, err):
             self._set_busy(False)
@@ -3667,15 +3860,23 @@ if HAS_TK:
             if err is not None:
                 self._set_result("状态检测失败：%s" % err, C_DANGER_TEXT)
                 self._refresh_daemon_ui(False)
-                self._set_autostart_ui(False, "计划任务：检测失败", ok=False)
+                self._set_autostart_ui(autostart_state(),
+                                       "开机自启：检测失败", ok=False)
                 return
-            state, daemon, task, ip = result
+            state, daemon, task, ip, cleaned = result
             self.local_ip = ip
             dropped = self._apply_net_state(state)
             if dropped:
                 self._show_banner()
             self._refresh_daemon_ui(daemon)
             self._set_autostart_ui(task)
+            n, paths = cleaned
+            if n:
+                self._set_result(
+                    "已清理 %d 条失效的开机自启登记（指向已不存在的文件：%s）。"
+                    "它只是躺在注册表里的残留，不会真起来；需要开机自启请打开上面的开关。"
+                    % (n, paths[0] if paths else "旧路径"), C_WARN_TEXT,
+                    target="boot")
 
         # ---------- 本机 MAC ----------
 
@@ -3947,15 +4148,18 @@ if HAS_TK:
                     ok, msg = unregister_autostart()
             except Exception as e:
                 ok, msg = False, str(e)
-            # 真实状态在**后台线程**查：autostart_enabled() 内部是
-            # subprocess.run(schtasks, timeout=15)，放主线程最坏会冻结界面 15 秒。
-            # 无论如何都以计划任务的实际存在与否为准回填，避免「动作返回成功但
-            # 任务被系统回滚」导致开关与真实状态脱节。
+            # 真实状态在**后台线程**查：autostart_state() 内部会跑 schtasks
+            # （timeout=15），放主线程最坏会冻结界面 15 秒。
+            # 无论如何都以**实际登记情况**为准回填，避免「动作返回成功但
+            # 任务被系统回滚」导致开关与真实状态脱节。带快照返回，界面才能把
+            # 「自启开着、但开的是另一份副本」这类情况说清楚。
+            st = None
             try:
-                real = autostart_enabled()
+                st = autostart_state()
+                real = st["enabled"]
             except Exception:
                 real = want if ok else (not want)
-            return ok, msg, real
+            return ok, msg, real, st
 
         def _done_toggle_autostart(self, want, res, err):
             self._set_busy(False, op="autostart")
@@ -3970,8 +4174,8 @@ if HAS_TK:
                 return
             cfg, result = res
             self.cfg = cfg
-            ok, msg, real = result
-            self._set_autostart_ui(real, msg, ok=ok)
+            ok, msg, real, st = result
+            self._set_autostart_ui(st if st is not None else real, msg, ok=ok)
 
         # ---------- 维护 ----------
 

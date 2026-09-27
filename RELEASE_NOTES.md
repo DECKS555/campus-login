@@ -1,11 +1,11 @@
-# v2.1.1
+# v2.1.2
 
-> 仓库 `DECKS555/campus-login` 已填好。推 Tag `v2.1.1` 后再创建 Release。
+> 仓库 `DECKS555/campus-login` 已填好。推 Tag `v2.1.2` 后再创建 Release。
 
 ## 标题（Release title）
 
 ```
-校园网一键登录 v2.1.1 — 校园网自动认证 + 后台保活（Windows）
+校园网一键登录 v2.1.2 — 校园网自动认证 + 后台保活（Windows）
 ```
 
 ## 发布正文（复制下方 ```markdown 块里的内容到 Release 描述框）
@@ -40,8 +40,8 @@
 **⑦ 参数可调，改完即生效**
 检测间隔、在线间隔、内容校验间隔、心跳日志间隔、退避上限都可在设置页调整；改完点「保存参数」立即落盘——**后台保活运行中无需重启**，约一个检测间隔内自动生效。
 
-**⑧ 开机自启**
-可一键开启开机自动拉起后台保活（走 Windows 计划任务，开机时不弹窗口、不弹 UAC）。
+**⑧ 开机自启 —— 状态不再骗人**
+可一键开启开机自动拉起后台保活，全程不弹窗口、不弹 UAC。程序会核对自启登记到底指向哪份 exe：搬过家、删过旧副本之后，界面会如实告诉我们，并自动清掉那些指向已不存在路径的失效登记。
 
 **⑨ 内置更新检查**
 直接对接本仓库的 GitHub Releases，在「设置 → 检查更新」即可查看新版本。也支持不改代码换成你自己的仓库：在 `config.json` 里加 `"update_repo": "你的用户名/你的仓库名"` 即可（优先级高于内置值）。
@@ -51,10 +51,11 @@
 
 ---
 
-## 本次更新（v2.1.1）
+## 本次更新（v2.1.2）
 
-- **后台保活不再在任务栏通知区域留下图标。** 旧版为了让提醒有落点，一启动就把图标挂进通知区域且从不移除，于是那里会长期蹲着一个点它也没反应的校园网图标。现在改成「按需挂载、弹完即卸」：平时一个图标都没有，只有真的触发「网络已恢复」「已让位给其他设备」这类提醒时才短暂出现约 8 秒，随后自动消失。
-- **修复自行打包时图标丢失的问题。** `--icon` 只设置 exe 文件自身的图标、不会把 `app.ico` 放进运行时目录，导致用 `src/build.bat` 打出来的 exe 标题栏 / 任务栏图标退回默认样式。已补齐打包参数（同时补上惰性导入的 `notify_win` 模块）。
+- **修复「开机自启显示已开启，但开机从来没启动过」。** 现象是开关一直是「已开启」，可每次开机 / 登录 Windows 之后后台保活都没起来，得手动打开程序登录一次。根因有两条：系统里那条自启登记还指着**早就被删掉的旧目录**（Windows 如实执行一个不存在的路径，于是静默什么都不做），而程序的判断只看「有没有登记项」、不看「登记指向的是不是自己」，于是这行失效登记照样被算成已开启——界面亮着绿灯，功能其实是死的。
+- **改成自启三态判定。** 每条登记（计划任务 + 注册表）现在会被分成「指向本程序 / 指向另一份副本 / 指向的文件已不存在」三态，只有指向本程序才算真正开启；GUI 启动时会在后台自动清掉失效残留，并给一条说人话的回执（清理了什么、原本指向哪儿）；「取消自启」也能把失效残留真正删干净。
+- **界面能区分"自启开着，但开的是另一份副本"。** 以前这种情况一律显示「已开启」，现在会给出那份副本的路径。
 
 完整变更记录见仓库内的 `更新日志.txt`。
 
@@ -101,33 +102,18 @@
 ## 发布前检查清单
 
 - [x] `UPDATE_REPO` 为 `DECKS555/campus-login`（`src/app.py`）
-- [x] `src/app.py` 里 `APP_VERSION = "v2.1.1"`，与 Tag 一致
-- [x] `CampusLogin.exe` 已换成 v2.1.1，且与 `src/` 源码一致
+- [x] `src/app.py` 里 `APP_VERSION = "v2.1.2"`，与 Tag 一致
+- [x] `CampusLogin.exe` 已换成 v2.1.2，且与 `src/` 源码一致
 - [x] `CampusLogin.exe --gui-smoke` 自检通过（53 项断言全过）
-- [x] 仓库内没有 `config.json` / `login.log` / `app.pid` / `daemon_state.json`
+- [x] 仓库没有 `config.json` / `login.log` / `app.pid` / `daemon_state.json` 被提交（已被 `.gitignore` 排除）
 - [x] README / Release 文案里的用户名、仓库名已替换为真实值
 - [ ] 仓库设为 **Public**（否则用户点「检查更新」会 404）
 
 ## 推送命令
 
-> 本地仓库已提交并打好 `v2.1.1` tag，所以**只需执行下面两条 push**。
+> 本地仓库已提交并打好 `v2.1.2` tag，所以**只需执行下面两条 push**。
 
 ```powershell
 cd D:\first-cc\campus-login
-
-# 把 <TOKEN> 换成你的 GitHub Personal Access Token（生成步骤见 D:\first-cc\上传步骤.md）
-git push https://DECKS555:<TOKEN>@github.com/DECKS555/campus-login.git main
-git push https://DECKS555:<TOKEN>@github.com/DECKS555/campus-login.git v2.1.1
-```
-
-如果上面的方式提示认证失败，改用不带 token 的地址推送，等弹出登录框时：
-用户名填 `DECKS555`，密码框粘贴 **Token**（不是 GitHub 登录密码）。
-
-更安全的方式（不在命令行里留下 token）：
-
-```bash
-git -c credential.helper="!printf 'username=DECKS555\npassword=<TOKEN>\n'" \
-    -c credential.helperOnce=true push -u origin main
-git -c credential.helper="!printf 'username=DECKS555\npassword=<TOKEN>\n'" \
-    -c credential.helperOnce=true push origin v2.1.1
+python ..\校园网一键登录-作者包\pub\publish_release.py
 ```
