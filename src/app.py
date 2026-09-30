@@ -134,7 +134,7 @@ LOG_TAIL_MAX = 40                       # 日志卡最多显示几行（窗口�
 # 运行日志显示异常"。放得下就显示，一行也放不下就收起来。
 LOG_MIN_ROOM = LOG_ROW_H
 LOG_PAGE_LINES = 200                    # 运行日志页完整视图行数
-APP_VERSION = "v2.1.2"
+APP_VERSION = "v2.1.3"
 
 # 更新服务器的「仓库名」，格式 "用户名/仓库名"（GitHub Releases）。
 # 留空 = 没有配更新服务器，「检查更新」退化为只显示本机版本信息。
@@ -3077,6 +3077,18 @@ if HAS_TK:
                      bg=C_CARD, fg=C_TEXT_2, font=(FONT_UI, 12), anchor="w",
                      justify="left", wraplength=_px(640)).pack(
                 anchor="w", pady=(_px(6), 0))
+            # GitHub 发布页做成可点链接：以前只写版本号，想升级的人还得自己去找仓库
+            page_url = self._releases_url()
+            if page_url:
+                link = tk.Label(card.body, text="GitHub 发布页：%s" % page_url,
+                                bg=C_CARD, fg=C_GRAD_TOP,
+                                font=(FONT_UI, 12, "underline"),
+                                cursor="hand2", anchor="w", justify="left",
+                                wraplength=_px(640))
+                link.pack(anchor="w", pady=(_px(8), 0))
+                link.bind("<Button-1>", lambda e, u=page_url: self._open_url(u))
+                link.bind("<Enter>", lambda e: link.configure(fg=C_GRAD_BOTTOM))
+                link.bind("<Leave>", lambda e: link.configure(fg=C_GRAD_TOP))
             tk.Label(card.body,
                      text="提示：转发本文件夹给他人前，请先删除 config.json"
                           "（其中保存了你的密码）。",
@@ -4287,28 +4299,59 @@ if HAS_TK:
                     lines.append("发布日期：%s" % info["published"])
                 if notes:
                     lines += ["", "更新说明：", notes]
-                lines.append("")
-                lines.append("是否打开下载页面？")
-                try:
-                    if messagebox.askyesno("检查更新", "\n".join(lines),
-                                           parent=self.root):
-                        url = info.get("page") or info.get("url") or ""
-                        if url:
-                            webbrowser.open(url)
-                except Exception:
-                    logging.debug("打开下载页面失败", exc_info=True)
+                # 有新版本时优先跳到它自己的 Release 页，比发布页首页更近一步
+                self._show_with_link(
+                    "检查更新", lines,
+                    url=(info.get("page") or info.get("url") or ""))
                 return
 
             if status == "up_to_date":
-                messagebox.showinfo(
+                self._show_with_link(
                     "检查更新",
-                    "当前已是最新版本：%s\n\n服务器上最新为 %s。"
-                    % (APP_VERSION, info.get("version") or APP_VERSION),
-                    parent=self.root)
+                    ["当前已是最新版本：%s" % APP_VERSION,
+                     "服务器上最新为 %s。" % (info.get("version") or APP_VERSION)])
                 return
 
             # unknown：校园网未认证时公网不通是常态，如实说明即可
             self._show_version_info(offline=True)
+
+        def _releases_url(self):
+            """当前仓库的 GitHub 发布页地址；仓库没配/不合法返回空串。"""
+            return core.releases_page_url(
+                str(self.cfg.get("update_repo") or UPDATE_REPO or ""))
+
+        def _open_url(self, url):
+            """用系统默认浏览器打开链接；失败不弹错框（未认证时打不开外网是常态）。"""
+            if not url:
+                return False
+            try:
+                webbrowser.open(url)
+                return True
+            except Exception:
+                logging.debug("打开链接失败", exc_info=True)
+                return False
+
+        def _show_with_link(self, title, lines, url=None, ask=True):
+            """弹消息框并在正文附上网址，有网址时再问一句要不要打开。
+
+            messagebox 里的文字没法做成可点的链接，所以退而求其次：把地址写清楚
+            （至少能复制），再用「是/否」提供一个一键跳转的入口。
+            """
+            url = url or self._releases_url()
+            body = list(lines)
+            if url:
+                body += ["", "发布页：%s" % url]
+            if url and ask:
+                body.append("")
+                body.append("是否打开发布页？")
+            try:
+                if url and ask:
+                    if messagebox.askyesno(title, "\n".join(body), parent=self.root):
+                        self._open_url(url)
+                else:
+                    messagebox.showinfo(title, "\n".join(body), parent=self.root)
+            except Exception:
+                logging.debug("弹版本信息框失败", exc_info=True)
 
         def _show_version_info(self, offline=False):
             """本机版本信息（没配更新服务器 / 连不上时的兜底展示）。"""
@@ -4328,7 +4371,7 @@ if HAS_TK:
                 "升级方式：用新版 CampusLogin.exe 覆盖旧文件即可，",
                 "config.json 里的账号密码配置不受影响。",
             ]
-            messagebox.showinfo("关于版本", "\n".join(lines), parent=self.root)
+            self._show_with_link("关于版本", lines)
 
         def on_open_logdir(self):
             """打开程序所在目录（log 与 config 都在这里）。"""
@@ -5442,6 +5485,7 @@ def main(argv=None):
             repo = UPDATE_REPO or "(未设置)"
             print("CampusLogin %s" % APP_VERSION)
             print("更新仓库: %s" % repo)
+            print("发布页: %s" % (core.releases_page_url(UPDATE_REPO) or "(未设置)"))
             print("配置文件: %s" % core.CONFIG_PATH)
             return 0
         if "--daemon" in argv:

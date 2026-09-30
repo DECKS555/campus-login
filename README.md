@@ -4,7 +4,7 @@
 
 填一次校园网账号密码，之后连上校园网即可自动认证；掉线自动重连，可常驻后台运行，关掉窗口也不影响联网——而且**不会在任务栏右下角留下任何图标**。
 
-当前版本：**v2.1.2** · [更新日志](更新日志.txt) · [Releases](https://github.com/DECKS555/campus-login/releases/latest)
+当前版本：**v2.1.3** · [更新日志](更新日志.txt) · [Releases](https://github.com/DECKS555/campus-login/releases/latest)
 
 ![主界面截图](docs/screenshots/01-connect.png)
 

@@ -1936,6 +1936,21 @@ def fetch_bound_operator(cfg, timeout=12, use_cache=True):
     return bound
 
 
+def _cas_login_landed(after_url):
+    """提交凭据后是否真的拿到了票据（而不是被原样退回登录页）。
+
+    CAS 登录失败时是 **HTTP 200 + 同一张登录页**（没有 Location），而登录页本身
+    照样带着 login-croypto / login-page-flowkey——所以「页面上能取到密钥」根本不
+    能证明登录成功了。实测自助服务在被短时间内反复登录时会这样静默退回登录页，
+    随后 /sam/api/userself/devices 一律 401，礼让复查便一直拿到 DEV_UNKNOWN。
+    """
+    if not after_url:
+        return False
+    if "ticket=ST-" in after_url or "code=" in after_url:
+        return True
+    return "/cas-sso/login" not in after_url
+
+
 def _selfservice_login(op, cfg, timeout=12):
     """在给定 opener 上完成自助服务的 CAS 登录，成功返回 True。
 
@@ -1959,10 +1974,16 @@ def _selfservice_login(op, cfg, timeout=12):
         "password": encrypt_text(key_b64, cfg["password"]),
         "captcha_payload": encrypt_text(key_b64, "{}"),
     }).encode("utf-8")
-    _fetch_follow(op, final_url + "&accept-language=zh-CN", data=form,
-                  headers={"Content-Type": "application/x-www-form-urlencoded",
-                           "Origin": "http://" + host, "Referer": final_url},
-                  method="POST", timeout=timeout)
+    after_url, _st2, _page2, _ = _fetch_follow(
+        op, final_url + "&accept-language=zh-CN", data=form,
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Origin": "http://" + host, "Referer": final_url},
+        method="POST", timeout=timeout)
+    if not _cas_login_landed(after_url):
+        # 以前这里无条件 return True，于是"登录其实没生效"被当成成功，后面所有
+        # 自助服务接口都 401，调用方只看到 DEV_UNKNOWN（旧代码连日志都没有）。
+        logging.info("自助服务 CAS 登录未生效（仍停留在登录页），按未登录处理")
+        return False
     return True
 
 
@@ -2155,6 +2176,35 @@ def _short_mac(mac):
     return ("尾号 %s" % m[-4:].upper()) if len(m) >= 4 else "未知"
 
 
+_DURATION_UNITS = (
+    (("天", "日"), 86400),
+    (("小时", "时"), 3600),
+    (("分钟", "分"), 60),
+    (("秒",), 1),
+)
+
+
+def parse_duration_seconds(text):
+    """把自助服务给的在线时长（"1时39分42秒" / "2小时5分钟"）解析成秒。
+
+    解析不出来返回 None（**不是 0**）：调用方必须区分"在线时长为 0"和"看不懂这个
+    格式"，后者按未知处理、不参与任何判定。
+    """
+    if not text:
+        return None
+    s = str(text)
+    total = 0
+    hit = False
+    for names, scale in _DURATION_UNITS:
+        for n in names:
+            m = re.search(r"(\d+)\s*%s" % n, s)
+            if m:
+                total += int(m.group(1)) * scale
+                hit = True
+                break
+    return total if hit else None
+
+
 def fetch_online_devices(cfg, timeout=12, use_cache=True):
     """查「当前哪些设备在线」，返回 list[dict]；**查不到返回 None（未知）**。
 
@@ -2170,6 +2220,9 @@ def fetch_online_devices(cfg, timeout=12, use_cache=True):
     op, _cj = _selfservice_opener()
     try:
         if not _selfservice_login(op, cfg, timeout=timeout):
+            # 不能静默返回 None：礼让期每轮都靠它判断「对方走了没」，查不出来又不
+            # 留痕，用户只会看到"手机都断了电脑还不上线"却查不到任何线索。
+            logging.info("自助服务登录未成功，本次按「查不出在线设备」处理")
             return None
         req = urllib.request.Request(
             "http://%s%s" % (cfg["portal_host"], SELF_DEVICES_API),
@@ -2203,26 +2256,35 @@ def classify_online_devices(devices, mine_macs=None, my_ip=""):
     devices 为 None（查不出来）时返回 DEV_UNKNOWN：调用方必须按"未知"处理，
     **绝不能**据此当成"没人在线"去抢线。
     """
+    return classify_online_devices_ex(devices, mine_macs, my_ip)[:2]
+
+
+def classify_online_devices_ex(devices, mine_macs=None, my_ip=""):
+    """同 classify_online_devices，但额外返回判定所依据的那条设备记录。
+
+    多返回它是为了让保活循环追踪「对方的在线时长是否还在增长」——那是判断 SAM 上
+    的在线记录是不是僵尸（设备其实早已断开、记录却还挂着）的唯一线索。
+    """
     if devices is None:
-        return DEV_UNKNOWN, ""
+        return DEV_UNKNOWN, "", None
     if not devices:
-        return DEV_NONE, "当前没有设备在线"
+        return DEV_NONE, "当前没有设备在线", None
     mine = local_mac_addresses() if mine_macs is None else mine_macs
     for d in devices:
         if d.get("mac") and d["mac"] in mine:
             return DEV_MINE, "%s（%s，已在线 %s）" % (
                 d.get("type") or "设备", d.get("ip") or "无 IP",
-                d.get("duration") or "未知时长")
+                d.get("duration") or "未知时长"), d
     # MAC 对不上时再用 IP 兜一次（虚拟网卡 / 网卡改名会让 MAC 取不全）
     if my_ip:
         for d in devices:
             if d.get("ip") and d["ip"] == my_ip:
                 return DEV_MINE, "%s（%s，按 IP 匹配）" % (
-                    d.get("type") or "设备", my_ip)
+                    d.get("type") or "设备", my_ip), d
     d = devices[0]
     return DEV_OTHER, "%s（%s，IP %s，已在线 %s）" % (
         d.get("type") or "其他设备", _short_mac(d.get("mac")),
-        d.get("ip") or "无 IP", d.get("duration") or "未知时长")
+        d.get("ip") or "无 IP", d.get("duration") or "未知时长"), d
 
 
 def check_online_owner(cfg):
@@ -2231,8 +2293,14 @@ def check_online_owner(cfg):
     这是保活循环里判断该不该让位的**首选依据**：确证在线的是别的设备就让位，
     确证没人在线/是本机就正常登录，只有查不出来（DEV_UNKNOWN）才退回窗口推断。
     """
+    return check_online_owner_ex(cfg)[:2]
+
+
+def check_online_owner_ex(cfg):
+    """同 check_online_owner，额外返回判定依据的设备记录（见
+    classify_online_devices_ex 的说明）。"""
     devices = fetch_online_devices(cfg)
-    return classify_online_devices(
+    return classify_online_devices_ex(
         devices, my_ip=local_gateway_ip(cfg.get("portal_host", "")))
 
 
@@ -2250,6 +2318,8 @@ def check_online_owner(cfg):
 
 GITHUB_API_LATEST = "https://api.github.com/repos/%s/releases/latest"
 GITHUB_ATOM = "https://github.com/%s/releases.atom"
+# 给人看的发布页（不是 API）：关于页展示、以及"检查更新"结果里给出跳转入口
+GITHUB_RELEASES_PAGE = "https://github.com/%s/releases"
 UPDATE_TIMEOUT = 6              # 未认证时公网会被 NAS 拦，超时必须短，别把界面卡住
 UPDATE_MIN_GAP = 30             # 进程内冷却秒数，防连点把限流打满
 _LAST_UPDATE_TS = 0.0           # 上次实际发起查询的时间戳（进程内冷却用）
@@ -2349,6 +2419,21 @@ def _quote_repo(repo):
     """
     parts = [p for p in str(repo or "").split("/") if p]
     return "/".join(urllib.parse.quote(p, safe="") for p in parts)
+
+
+def releases_page_url(repo):
+    """仓库的 Release 发布页地址（关于页展示 / 检查更新时跳转用）。
+
+    拿不到合法 "owner/repo" 就返回空串——调用方按"没有链接"处理，别拼出个
+    打不开的地址去误导人。
+    """
+    repo = str(repo or "").strip().strip("/")
+    if repo.count("/") != 1:
+        return ""
+    owner, name = repo.split("/")
+    if not owner or not name:
+        return ""
+    return GITHUB_RELEASES_PAGE % _quote_repo(repo)
 
 
 def check_update(repo, current_version, timeout=UPDATE_TIMEOUT):
@@ -2471,6 +2556,14 @@ def run_probe(cfg):
 # 最多这么多秒之后就会自己连上，不需要 Windows 的网络事件来叫醒。
 _OFFLINE_INTERVAL_SECONDS = 60
 
+# 礼让期复查「谁在线」的间隔上限。每次复查都要在自助服务上完整跑一遍 CAS 登录
+# （等于再提交一次密码），而自助服务带无感验证码——查得太密会被判定为异常，之后
+# 所有 /sam 接口一律 401，礼让复查反而彻底失效（2026-09-30 用户报的「手机都断了
+# 电脑还不上线」就是这条链：礼让 15 分钟，前 2 分钟查到对方在线，之后全被验证码
+# 挡住，又没有任何日志，只能干等到期满）。所以复查间隔随轮次放宽。
+_DEV_RECHECK_MAX = 300        # 对方仍在线时的复查间隔上限
+_DEV_RECHECK_MAX_FAIL = 600   # 连续查不出来时更保守，别再去刺激自助服务
+
 
 def next_interval(base, failures, cap):
     """退避间隔：连续失败 n 次后等 base*2^n 秒，封顶 cap。failures<=0 时返回 base。"""
@@ -2499,12 +2592,17 @@ class YieldPolicy:
     纯逻辑，不碰网络也不碰文件，便于单测。参数每轮从配置刷新（支持热改）。
     """
 
-    def __init__(self, enabled=True, window=180, first_minutes=15, max_minutes=120):
+    def __init__(self, enabled=True, window=180, first_minutes=15, max_minutes=120,
+                 stuck_rounds=1, stuck_grow_seconds=30):
         self.configure(enabled, window, first_minutes, max_minutes)
+        self.stuck_rounds = max(1, int(stuck_rounds))
+        self.stuck_grow_seconds = max(0, int(stuck_grow_seconds))
         self.yield_until = 0.0       # 礼让截止时间戳（0 = 未在礼让）
         self.yield_level = 0         # 连续被顶次数，决定礼让时长递增
         self.last_auth_ok_ts = None  # 上次认证成功的时间（None = 还没成功过）
         self.reason = ""             # 礼让原因（给界面显示）
+        # 礼让期间追踪「对方设备的在线时长」：mac -> {last: 上次秒数, stuck: 连续停滞次数}
+        self._dev_watch = {}
 
     def configure(self, enabled, window, first_minutes, max_minutes):
         was_on = getattr(self, "enabled", None)
@@ -2519,6 +2617,7 @@ class YieldPolicy:
             self.yield_level = 0
             self.last_auth_ok_ts = None
             self.reason = ""
+            self._dev_watch = {}
 
     def note_auth_ok(self, now=None):
         """认证成功时调用。"""
@@ -2585,6 +2684,31 @@ class YieldPolicy:
         self.yield_level = 0
         self.last_auth_ok_ts = None
         self.reason = ""
+        self._dev_watch = {}
+
+    def note_other_seen(self, mac, duration_sec):
+        """礼让期复查仍看到别的设备时调用：追踪它的「在线时长」是否还在增长。
+
+        解决的是这样一个真实场景：手机直接断开校园网（关 Wi-Fi / 走出信号范围），
+        SAM 上的在线记录却要过很久才清掉。此时每次复查都确证「别的设备在线」，
+        礼让就只能干等到期满——用户看到的就是「手机都断了，电脑还不上线」。
+
+        判据：会话还活着时在线时长会随复查间隔同步增长；若增长不足
+        stuck_grow_seconds，说明那条记录已经停止计时 = 形同僵尸的残留。
+        第一次见到某个 MAC 只建立基线，不判僵死。
+        """
+        if not mac or duration_sec is None:
+            # 认不出是谁 / 看不懂时长格式：没有可比的基础，清空并交回「未知」
+            self._dev_watch = {}
+            return False
+        w = self._dev_watch.get(mac)
+        if w is None:
+            self._dev_watch = {mac: {"last": duration_sec, "stuck": 0}}
+            return False
+        grew = duration_sec - w["last"]
+        w["stuck"] = w["stuck"] + 1 if grew <= self.stuck_grow_seconds else 0
+        w["last"] = duration_sec
+        return w["stuck"] >= self.stuck_rounds
 
 
 def write_daemon_state(**fields):
@@ -2672,6 +2796,8 @@ def run_forever(cfg):
     )
     last_hold_kind = None  # "yield" / None（当前是否处于礼让，用于状态显示）
     last_dev_check = 0.0   # 上次查「在线设备」的时间（礼让期间复查的节流）
+    dev_unknown_hits = 0   # 礼让期复查连续「查不出来」的次数（够多就降级）
+    dev_other_hits = 0     # 礼让期复查连续看到「别的设备」的次数（只用于日志节流）
 
     while True:
         # 每轮重载一次配置。原来全程只用入参这份启动瞬间的快照：用户在界面改了
@@ -2769,25 +2895,89 @@ def run_forever(cfg):
             #    强行认证只会把对方踢掉、然后被对方踢回来，陷入互相踢 ——
             hold = False
             recheck = _cfg_int(cfg, "device_recheck_seconds", minimum=30)
+            cur_recheck = recheck
             if policy.remaining(now) > 0:
                 # 已在礼让期内：定期复查，对方一下线就提前恢复，别干等满 15 分钟
                 hold = True
                 if cfg.get("device_check_enabled", True) \
-                        and (now - last_dev_check) >= recheck:
+                        and (now - last_dev_check) >= cur_recheck:
                     last_dev_check = now
-                    verdict, info = check_online_owner(cfg)
+                    verdict, info, dev = check_online_owner_ex(cfg)
                     if verdict in (DEV_NONE, DEV_MINE):
                         policy.clear_yield_now()
                         logging.info("对方设备已下线（%s），提前结束让位并立即登录",
                                      info)
                         logged = True
                         hold = False
+                    elif verdict == DEV_OTHER:
+                        dev_unknown_hits = 0
+                        dev_other_hits += 1
+                        if policy.note_other_seen(
+                                (dev or {}).get("mac", ""),
+                                parse_duration_seconds((dev or {}).get("duration", ""))):
+                            # 对方记录还挂在 SAM 上，但它的在线时长已经不再增长：
+                            # 会话停止计时 = 设备实际早已断开（手机关掉 Wi-Fi /
+                            # 走出信号范围后，SAM 常常要过很久才清掉在线记录）。
+                            logging.warning(
+                                "对方设备的在线时长停在 %s 不再增长（%s）——判定其"
+                                "实际已断开，提前结束让位并立即登录",
+                                (dev or {}).get("duration") or "未知时长", info)
+                            policy.clear_yield_now()
+                            logged = True
+                            hold = False
+                        elif dev_other_hits == 1 or dev_other_hits % 5 == 0:
+                            # 复查留痕：以前礼让期每 2 分钟查一次却一个字都不写，
+                            # 真出了「手机都断了电脑还不上线」根本无从回溯。
+                            logging.info("礼让复查：%s（第 %d 次仍在线）",
+                                         info, dev_other_hits)
+                            logged = True
+                        # 每次复查都要重新登录一次自助服务，放宽间隔以免触发验证码
+                        cur_recheck = min(recheck * min(dev_other_hits, 3),
+                                          _DEV_RECHECK_MAX)
+                    else:
+                        # DEV_UNKNOWN：查不出来。以前就此静默干等到礼让期满——而自助
+                        # 服务是有可能整体不可用的（实测会被静默退回登录页，之后所有
+                        # /sam 接口 401），那时礼让就是一个没有出口的定时炸弹，用户
+                        # 只能手动点登录。连续两次查不出来就认定"设备判定这条腿瘸了"，
+                        # 退回窗口推断：由「距上次认证多久」决定是登录还是继续让位。
+                        dev_unknown_hits += 1
+                        if dev_unknown_hits == 1 or dev_unknown_hits % 5 == 0:
+                            logging.info("礼让复查：查不到在线设备（第 %d 次）%s",
+                                         dev_unknown_hits,
+                                         ("，%s" % info) if info else "")
+                            logged = True
+                        if dev_unknown_hits >= 2:
+                            dev_unknown_hits = 0
+                            minutes = policy.check_preempted(now)
+                            if minutes:
+                                logging.warning(
+                                    "设备查询连续不可用，按行为推断被其他设备顶掉，"
+                                    "让位 %d 分钟后再试", minutes)
+                                notify_yield(minutes)
+                                hold = True
+                            else:
+                                logging.info(
+                                    "设备查询连续不可用，且距上次认证已超过判定窗口，"
+                                    "结束让位并立即登录")
+                                policy.clear_yield_now()
+                                hold = False
+                            logged = True
+                        # 已知自助服务在闹脾气，下次复查更晚一点，别再去撞验证码
+                        cur_recheck = min(recheck * (dev_unknown_hits + 1),
+                                          _DEV_RECHECK_MAX_FAIL)
             elif cfg.get("device_check_enabled", True):
                 # 首选判据：直接看「在线设备的 MAC 是不是本机」（确证）
-                verdict, info = check_online_owner(cfg)
+                verdict, info, dev = check_online_owner_ex(cfg)
                 if verdict == DEV_OTHER:
                     minutes = policy.preempt_by_device(now, info)
                     last_dev_check = now
+                    dev_unknown_hits = 0
+                    dev_other_hits = 0
+                    # 当场给「在线时长」建基线：下一轮复查就能比出对方的时间有没有
+                    # 继续走，不用再白等一轮才能发现记录已经僵死。
+                    policy.note_other_seen(
+                        (dev or {}).get("mac", ""),
+                        parse_duration_seconds((dev or {}).get("duration", "")))
                     logging.warning(
                         "检测到其他设备正在使用本账号（%s），让位 %d 分钟后再试",
                         info, minutes)
@@ -2822,7 +3012,7 @@ def run_forever(cfg):
                 # 礼让期间不发起认证。interval 取「复查周期」与「剩余时长」的较小
                 # 值，这样对方一走最多等一轮就能恢复，而不是干等到礼让期满。
                 left = policy.remaining(now)
-                interval = max(base, min(int(left) if left else base, recheck))
+                interval = max(base, min(int(left) if left else base, cur_recheck))
                 last_hold_kind = "yield"
                 write_daemon_state(yield_until=policy.yield_until,
                                    reason=policy.reason)
